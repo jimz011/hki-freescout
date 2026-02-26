@@ -1,0 +1,36 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to FreeScout",
+        "description": "Enter the URL of your FreeScout instance and an API key.\n\nFind your API key under **Profile → API Keys** in FreeScout.\n\nLeave **Agent ID** as `0` to skip the 'My Assigned Tickets' sensor.",
+        "data": {
+          "base_url": "FreeScout URL",
+          "api_key": "API Key",
+          "agent_id": "Agent ID (0 = disabled)",
+          "scan_interval": "Scan interval (seconds)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Unable to reach FreeScout. Check the URL and network access.",
+      "invalid_auth": "Invalid API key. Check your FreeScout profile settings.",
+      "unknown": "Unexpected error. Check the HA logs."
+    },
+    "abort": {
+      "already_configured": "This FreeScout instance is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "FreeScout Options",
+        "description": "Set **Agent ID** to `0` to disable the 'My Assigned Tickets' sensor.",
+        "data": {
+          "scan_interval": "Scan interval (seconds, min 10)",
+          "agent_id": "Agent ID (0 = disabled)"
+        }
+      }
+    }
+  }
+}

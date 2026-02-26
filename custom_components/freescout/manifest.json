@@ -1,0 +1,11 @@
+{
+  "domain": "freescout",
+  "name": "FreeScout",
+  "documentation": "https://freescout.net",
+  "requirements": [],
+  "dependencies": [],
+  "codeowners": [],
+  "version": "1.0.0",
+  "iot_class": "cloud_polling",
+  "config_flow": true
+}
