@@ -31,6 +31,9 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# FreeScout PHP constant: Folder::TYPE_UNASSIGNED = 1
+_FOLDER_TYPE_UNASSIGNED = 1
+
 
 class FreescoutCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Polls the FreeScout API and fires HA events for new conversations."""
@@ -72,9 +75,7 @@ class FreescoutCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             open_count = await self._get_count_for_mailboxes(
                 session, {"status": "active"}
             )
-            unassigned_count = await self._get_count_for_mailboxes(
-                session, {"status": "active", "assignedTo": ""}
-            )
+            unassigned_count = await self._get_unassigned_count(session)
             new_count = await self._check_new_conversations(session)
 
             my_tickets_count: int | None = None
@@ -98,6 +99,60 @@ class FreescoutCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             SENSOR_NEW: new_count,
             SENSOR_MY_TICKETS: my_tickets_count,
         }
+
+    async def _get_unassigned_count(self, session: aiohttp.ClientSession) -> int:
+        """Return unassigned count by reading the folder API, matching the FreeScout UI."""
+        if self.mailbox_ids:
+            mailbox_list = self.mailbox_ids
+        else:
+            mailbox_list = await self._fetch_all_mailbox_ids(session)
+            if not mailbox_list:
+                return 0
+
+        counts = await asyncio.gather(
+            *[
+                self._get_folder_count(session, mbid, _FOLDER_TYPE_UNASSIGNED)
+                for mbid in mailbox_list
+            ]
+        )
+        return sum(counts)
+
+    async def _get_folder_count(
+        self, session: aiohttp.ClientSession, mailbox_id: int, folder_type: int
+    ) -> int:
+        """Return the ticket count for a folder type within a mailbox."""
+        async with session.get(
+            f"{self.base_url}/api/mailboxes/{mailbox_id}/folders",
+            headers=self._headers,
+        ) as resp:
+            if not resp.ok:
+                _LOGGER.warning(
+                    "Could not fetch folders for mailbox %s (HTTP %s)",
+                    mailbox_id,
+                    resp.status,
+                )
+                return 0
+            data: dict = await resp.json()
+
+        folders: list[dict] = data.get("_embedded", {}).get("folders", [])
+        for folder in folders:
+            if folder.get("type") == folder_type:
+                return int(folder.get("count", 0))
+        return 0
+
+    async def _fetch_all_mailbox_ids(
+        self, session: aiohttp.ClientSession
+    ) -> list[int]:
+        """Fetch all mailbox IDs from the API (used when no mailbox filter is set)."""
+        async with session.get(
+            f"{self.base_url}/api/mailboxes",
+            headers=self._headers,
+        ) as resp:
+            if not resp.ok:
+                return []
+            data: dict = await resp.json()
+        mailboxes: list[dict] = data.get("_embedded", {}).get("mailboxes", [])
+        return [int(mb["id"]) for mb in mailboxes]
 
     async def _get_count_for_mailboxes(
         self, session: aiohttp.ClientSession, base_params: dict[str, str]
