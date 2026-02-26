@@ -16,8 +16,13 @@ DEFAULT_AGENT_ID = 0  # 0 = disabled
 # Sensor keys
 SENSOR_OPEN = "open_tickets"
 SENSOR_UNASSIGNED = "unassigned_tickets"
+SENSOR_PENDING = "pending_tickets"
+SENSOR_SNOOZED = "snoozed_tickets"
 SENSOR_MY_TICKETS = "my_tickets"
 SENSOR_NEW = "new_tickets"
+
+# Prefix for dynamic custom-folder sensor data keys
+FOLDER_KEY_PREFIX = "folder_"
 
 # HA event fired when a new conversation is detected
 EVENT_NEW_CONVERSATION = f"{DOMAIN}_new_conversation"

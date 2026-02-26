@@ -23,16 +23,21 @@ from .const import (
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
     EVENT_NEW_CONVERSATION,
+    FOLDER_KEY_PREFIX,
     SENSOR_MY_TICKETS,
     SENSOR_NEW,
     SENSOR_OPEN,
+    SENSOR_PENDING,
+    SENSOR_SNOOZED,
     SENSOR_UNASSIGNED,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
-# FreeScout PHP constant: Folder::TYPE_UNASSIGNED = 1
+# FreeScout PHP folder type constants
 _FOLDER_TYPE_UNASSIGNED = 1
+_FOLDER_TYPE_SNOOZED = 180
+_FOLDER_TYPE_CUSTOM = 185
 
 
 class FreescoutCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -46,6 +51,9 @@ class FreescoutCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             CONF_MAILBOX_IDS,
             entry.data.get(CONF_MAILBOX_IDS, []),
         )
+
+        # Populated on first refresh; used by sensor.py to create dynamic entities
+        self.custom_folders: list[dict[str, str]] = []
 
         # Track known conversation IDs to detect new arrivals
         self._known_ids: set[int] = set()
@@ -72,11 +80,21 @@ class FreescoutCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         session = async_get_clientsession(self.hass)
 
         try:
-            open_count = await self._get_count_for_mailboxes(
-                session, {"status": "active"}
+            # Fetch all folder data and open/pending/new counts in parallel
+            folders_task = asyncio.create_task(
+                self._fetch_all_folders_for_mailboxes(session)
             )
-            unassigned_count = await self._get_unassigned_count(session)
-            new_count = await self._check_new_conversations(session)
+            open_task = asyncio.create_task(
+                self._get_count_for_mailboxes(session, {"status": "active"})
+            )
+            pending_task = asyncio.create_task(
+                self._get_count_for_mailboxes(session, {"status": "pending"})
+            )
+            new_task = asyncio.create_task(self._check_new_conversations(session))
+
+            all_folders, open_count, pending_count, new_count = await asyncio.gather(
+                folders_task, open_task, pending_task, new_task
+            )
 
             my_tickets_count: int | None = None
             if self.agent_id:
@@ -93,57 +111,100 @@ class FreescoutCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 f"Could not connect to FreeScout: {err}"
             ) from err
 
+        # Extract per-folder counts from the combined folder list
+        unassigned_count = sum(
+            f.get("activeCount", 0)
+            for f in all_folders
+            if f.get("type") == _FOLDER_TYPE_UNASSIGNED
+        )
+        snoozed_count = sum(
+            f.get("activeCount", 0)
+            for f in all_folders
+            if f.get("type") == _FOLDER_TYPE_SNOOZED
+        )
+
+        # Aggregate custom folder counts by name across mailboxes
+        custom_counts: dict[str, int] = {}
+        for folder in all_folders:
+            if folder.get("type") == _FOLDER_TYPE_CUSTOM:
+                key = f"{FOLDER_KEY_PREFIX}{folder['name']}"
+                custom_counts[key] = (
+                    custom_counts.get(key, 0) + folder.get("activeCount", 0)
+                )
+
+        # Build the custom_folders list once (used by sensor.py for entity creation)
+        if not self.custom_folders and custom_counts:
+            self.custom_folders = [
+                {"name": key[len(FOLDER_KEY_PREFIX):], "key": key}
+                for key in custom_counts
+            ]
+
         return {
             SENSOR_OPEN: open_count,
             SENSOR_UNASSIGNED: unassigned_count,
+            SENSOR_PENDING: pending_count,
+            SENSOR_SNOOZED: snoozed_count,
             SENSOR_NEW: new_count,
             SENSOR_MY_TICKETS: my_tickets_count,
+            **custom_counts,
         }
 
-    async def _get_unassigned_count(self, session: aiohttp.ClientSession) -> int:
-        """Return unassigned count by reading the folder API, matching the FreeScout UI."""
+    # ------------------------------------------------------------------
+    # Folder helpers
+    # ------------------------------------------------------------------
+
+    async def _fetch_all_folders_for_mailboxes(
+        self, session: aiohttp.ClientSession
+    ) -> list[dict]:
+        """Return all folders across all selected (or all) mailboxes."""
         if self.mailbox_ids:
             mailbox_list = self.mailbox_ids
         else:
             mailbox_list = await self._fetch_all_mailbox_ids(session)
             if not mailbox_list:
-                return 0
+                return []
 
-        counts = await asyncio.gather(
+        per_mailbox = await asyncio.gather(
             *[
-                self._get_folder_count(session, mbid, _FOLDER_TYPE_UNASSIGNED)
+                self._fetch_all_folders_for_mailbox(session, mbid)
                 for mbid in mailbox_list
             ]
         )
-        return sum(counts)
+        return [folder for folders in per_mailbox for folder in folders]
 
-    async def _get_folder_count(
-        self, session: aiohttp.ClientSession, mailbox_id: int, folder_type: int
-    ) -> int:
-        """Return the ticket count for a folder type within a mailbox."""
-        async with session.get(
-            f"{self.base_url}/api/mailboxes/{mailbox_id}/folders",
-            headers=self._headers,
-        ) as resp:
-            if not resp.ok:
-                _LOGGER.warning(
-                    "Could not fetch folders for mailbox %s (HTTP %s)",
-                    mailbox_id,
-                    resp.status,
-                )
-                return 0
-            data: dict = await resp.json()
+    async def _fetch_all_folders_for_mailbox(
+        self, session: aiohttp.ClientSession, mailbox_id: int
+    ) -> list[dict]:
+        """Fetch every page of folders for a single mailbox."""
+        all_folders: list[dict] = []
+        page = 1
+        while True:
+            async with session.get(
+                f"{self.base_url}/api/mailboxes/{mailbox_id}/folders",
+                headers=self._headers,
+                params={"page": str(page)},
+            ) as resp:
+                if not resp.ok:
+                    _LOGGER.warning(
+                        "Could not fetch folders for mailbox %s (HTTP %s)",
+                        mailbox_id,
+                        resp.status,
+                    )
+                    break
+                data: dict = await resp.json()
 
-        folders: list[dict] = data.get("_embedded", {}).get("folders", [])
-        for folder in folders:
-            if folder.get("type") == folder_type:
-                return int(folder.get("count", 0))
-        return 0
+            all_folders.extend(data.get("_embedded", {}).get("folders", []))
+            page_info = data.get("page", {})
+            if page >= page_info.get("totalPages", 1):
+                break
+            page += 1
+
+        return all_folders
 
     async def _fetch_all_mailbox_ids(
         self, session: aiohttp.ClientSession
     ) -> list[int]:
-        """Fetch all mailbox IDs from the API (used when no mailbox filter is set)."""
+        """Fetch all mailbox IDs (used when no mailbox filter is set)."""
         async with session.get(
             f"{self.base_url}/api/mailboxes",
             headers=self._headers,
@@ -151,13 +212,16 @@ class FreescoutCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if not resp.ok:
                 return []
             data: dict = await resp.json()
-        mailboxes: list[dict] = data.get("_embedded", {}).get("mailboxes", [])
-        return [int(mb["id"]) for mb in mailboxes]
+        return [int(mb["id"]) for mb in data.get("_embedded", {}).get("mailboxes", [])]
+
+    # ------------------------------------------------------------------
+    # Conversation count helpers
+    # ------------------------------------------------------------------
 
     async def _get_count_for_mailboxes(
         self, session: aiohttp.ClientSession, base_params: dict[str, str]
     ) -> int:
-        """Return ticket count, summed across selected mailboxes (or all if none selected)."""
+        """Return ticket count, summed across selected mailboxes (or all if none)."""
         if not self.mailbox_ids:
             return await self._get_count(session, base_params)
         counts = await asyncio.gather(
@@ -171,16 +235,19 @@ class FreescoutCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _get_count(
         self, session: aiohttp.ClientSession, params: dict[str, str]
     ) -> int:
-        """Return the total element count for a conversation query."""
-        query = {**params, "perPage": "1", "page": "1"}
+        """Return the totalElements count for a conversations query."""
         async with session.get(
             f"{self.base_url}/api/conversations",
             headers=self._headers,
-            params=query,
+            params={**params, "perPage": "1", "page": "1"},
         ) as resp:
             resp.raise_for_status()
             data: dict = await resp.json()
         return data.get("page", {}).get("totalElements", 0)
+
+    # ------------------------------------------------------------------
+    # New-conversation detection
+    # ------------------------------------------------------------------
 
     async def _check_new_conversations(
         self, session: aiohttp.ClientSession
@@ -203,7 +270,6 @@ class FreescoutCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     for mbid in self.mailbox_ids
                 ]
             )
-            # Flatten and deduplicate by conversation ID
             seen: set[int] = set()
             conversations = []
             for convs in per_mailbox:
@@ -248,16 +314,10 @@ class FreescoutCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self, session: aiohttp.ClientSession, extra_params: dict[str, str]
     ) -> list[dict]:
         """Fetch the most recent active conversations (up to 50)."""
-        params = {
-            "status": "active",
-            "perPage": "50",
-            "page": "1",
-            **extra_params,
-        }
         async with session.get(
             f"{self.base_url}/api/conversations",
             headers=self._headers,
-            params=params,
+            params={"status": "active", "perPage": "50", "page": "1", **extra_params},
         ) as resp:
             resp.raise_for_status()
             data: dict = await resp.json()
