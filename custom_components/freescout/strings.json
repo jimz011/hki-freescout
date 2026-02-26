@@ -25,10 +25,11 @@
     "step": {
       "init": {
         "title": "FreeScout Options",
-        "description": "Set **Agent ID** to `0` to disable the 'My Assigned Tickets' sensor.",
+        "description": "Set **Agent ID** to `0` to disable the 'My Assigned Tickets' sensor.\n\nSelect the **mailboxes** whose tickets should be counted. Leave empty to include all mailboxes.",
         "data": {
           "scan_interval": "Scan interval (seconds, min 10)",
-          "agent_id": "Agent ID (0 = disabled)"
+          "agent_id": "Agent ID (0 = disabled)",
+          "mailbox_ids": "Mailboxes to include (empty = all)"
         }
       }
     }

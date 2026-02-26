@@ -7,11 +7,18 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.selector import (
+    SelectOptionDict,
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
+)
 
 from .const import (
     CONF_AGENT_ID,
     CONF_API_KEY,
     CONF_BASE_URL,
+    CONF_MAILBOX_IDS,
     CONF_SCAN_INTERVAL,
     DEFAULT_AGENT_ID,
     DEFAULT_SCAN_INTERVAL,
@@ -73,7 +80,7 @@ class FreescoutConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class FreescoutOptionsFlow(config_entries.OptionsFlow):
-    """Allow changing scan interval and agent ID after setup."""
+    """Allow changing scan interval, agent ID, and mailbox filter after setup."""
 
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
         self._entry = config_entry
@@ -82,6 +89,9 @@ class FreescoutOptionsFlow(config_entries.OptionsFlow):
         self, user_input: dict | None = None
     ) -> config_entries.FlowResult:
         if user_input is not None:
+            # SelectSelector returns strings; convert mailbox IDs back to ints
+            raw_ids = user_input.get(CONF_MAILBOX_IDS, [])
+            user_input[CONF_MAILBOX_IDS] = [int(mid) for mid in raw_ids]
             return self.async_create_entry(title="", data=user_input)
 
         current_interval = self._entry.options.get(
@@ -92,6 +102,31 @@ class FreescoutOptionsFlow(config_entries.OptionsFlow):
             CONF_AGENT_ID,
             self._entry.data.get(CONF_AGENT_ID, DEFAULT_AGENT_ID),
         )
+        current_mailbox_ids: list[int] = self._entry.options.get(
+            CONF_MAILBOX_IDS,
+            self._entry.data.get(CONF_MAILBOX_IDS, []),
+        )
+        # SelectSelector works with strings
+        current_mailbox_strs = [str(mid) for mid in current_mailbox_ids]
+
+        mailboxes = await self._fetch_mailboxes()
+
+        if mailboxes:
+            mailbox_selector = SelectSelector(
+                SelectSelectorConfig(
+                    options=[
+                        SelectOptionDict(value=str(mb["id"]), label=mb["name"])
+                        for mb in mailboxes
+                    ],
+                    multiple=True,
+                    mode=SelectSelectorMode.LIST,
+                )
+            )
+        else:
+            # API unreachable — show an empty selector so the form still renders
+            mailbox_selector = SelectSelector(
+                SelectSelectorConfig(options=[], multiple=True)
+            )
 
         return self.async_show_form(
             step_id="init",
@@ -103,9 +138,30 @@ class FreescoutOptionsFlow(config_entries.OptionsFlow):
                     vol.Optional(
                         CONF_AGENT_ID, default=current_agent
                     ): vol.Coerce(int),
+                    vol.Optional(
+                        CONF_MAILBOX_IDS, default=current_mailbox_strs
+                    ): mailbox_selector,
                 }
             ),
         )
+
+    async def _fetch_mailboxes(self) -> list[dict]:
+        """Return the list of mailboxes from the FreeScout API, or [] on error."""
+        base_url = self._entry.data[CONF_BASE_URL].rstrip("/")
+        api_key = self._entry.data[CONF_API_KEY]
+        session = async_get_clientsession(self.hass)
+        try:
+            async with session.get(
+                f"{base_url}/api/mailboxes",
+                headers={"X-FreeScout-API-Key": api_key},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if not resp.ok:
+                    return []
+                data: dict = await resp.json()
+                return data.get("_embedded", {}).get("mailboxes", [])
+        except aiohttp.ClientError:
+            return []
 
 
 async def _test_connection(hass, base_url: str, api_key: str) -> str | None:

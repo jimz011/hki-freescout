@@ -7,6 +7,7 @@ CONF_BASE_URL = "base_url"
 CONF_API_KEY = "api_key"
 CONF_AGENT_ID = "agent_id"
 CONF_SCAN_INTERVAL = "scan_interval"
+CONF_MAILBOX_IDS = "mailbox_ids"
 
 # Defaults
 DEFAULT_SCAN_INTERVAL = 60  # seconds

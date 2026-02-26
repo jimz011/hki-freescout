@@ -1,6 +1,7 @@
 """DataUpdateCoordinator for FreeScout."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import timedelta
 from typing import Any
@@ -16,6 +17,7 @@ from .const import (
     CONF_AGENT_ID,
     CONF_API_KEY,
     CONF_BASE_URL,
+    CONF_MAILBOX_IDS,
     CONF_SCAN_INTERVAL,
     DEFAULT_AGENT_ID,
     DEFAULT_SCAN_INTERVAL,
@@ -37,6 +39,10 @@ class FreescoutCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.base_url: str = entry.data[CONF_BASE_URL].rstrip("/")
         self.api_key: str = entry.data[CONF_API_KEY]
         self.agent_id: int = entry.data.get(CONF_AGENT_ID, DEFAULT_AGENT_ID)
+        self.mailbox_ids: list[int] = entry.options.get(
+            CONF_MAILBOX_IDS,
+            entry.data.get(CONF_MAILBOX_IDS, []),
+        )
 
         # Track known conversation IDs to detect new arrivals
         self._known_ids: set[int] = set()
@@ -63,15 +69,17 @@ class FreescoutCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         session = async_get_clientsession(self.hass)
 
         try:
-            open_count = await self._get_count(session, {"status": "active"})
-            unassigned_count = await self._get_count(
+            open_count = await self._get_count_for_mailboxes(
+                session, {"status": "active"}
+            )
+            unassigned_count = await self._get_count_for_mailboxes(
                 session, {"status": "active", "assignedTo": ""}
             )
             new_count = await self._check_new_conversations(session)
 
             my_tickets_count: int | None = None
             if self.agent_id:
-                my_tickets_count = await self._get_count(
+                my_tickets_count = await self._get_count_for_mailboxes(
                     session, {"status": "active", "assignedTo": str(self.agent_id)}
                 )
 
@@ -90,6 +98,20 @@ class FreescoutCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             SENSOR_NEW: new_count,
             SENSOR_MY_TICKETS: my_tickets_count,
         }
+
+    async def _get_count_for_mailboxes(
+        self, session: aiohttp.ClientSession, base_params: dict[str, str]
+    ) -> int:
+        """Return ticket count, summed across selected mailboxes (or all if none selected)."""
+        if not self.mailbox_ids:
+            return await self._get_count(session, base_params)
+        counts = await asyncio.gather(
+            *[
+                self._get_count(session, {**base_params, "mailboxId": str(mbid)})
+                for mbid in self.mailbox_ids
+            ]
+        )
+        return sum(counts)
 
     async def _get_count(
         self, session: aiohttp.ClientSession, params: dict[str, str]
@@ -115,17 +137,27 @@ class FreescoutCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         and returns the count of newly detected conversations.
         On the very first refresh we just record existing IDs without firing.
         """
-        async with session.get(
-            f"{self.base_url}/api/conversations",
-            headers=self._headers,
-            params={"status": "active", "perPage": "50", "page": "1"},
-        ) as resp:
-            resp.raise_for_status()
-            data: dict = await resp.json()
+        if not self.mailbox_ids:
+            conversations = await self._fetch_recent_conversations(session, {})
+        else:
+            per_mailbox = await asyncio.gather(
+                *[
+                    self._fetch_recent_conversations(
+                        session, {"mailboxId": str(mbid)}
+                    )
+                    for mbid in self.mailbox_ids
+                ]
+            )
+            # Flatten and deduplicate by conversation ID
+            seen: set[int] = set()
+            conversations = []
+            for convs in per_mailbox:
+                for c in convs:
+                    cid = int(c["id"])
+                    if cid not in seen:
+                        seen.add(cid)
+                        conversations.append(c)
 
-        conversations: list[dict] = (
-            data.get("_embedded", {}).get("conversations", [])
-        )
         current_ids = {int(c["id"]) for c in conversations}
 
         if self._first_refresh:
@@ -156,3 +188,22 @@ class FreescoutCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         self._known_ids = current_ids
         return new_count
+
+    async def _fetch_recent_conversations(
+        self, session: aiohttp.ClientSession, extra_params: dict[str, str]
+    ) -> list[dict]:
+        """Fetch the most recent active conversations (up to 50)."""
+        params = {
+            "status": "active",
+            "perPage": "50",
+            "page": "1",
+            **extra_params,
+        }
+        async with session.get(
+            f"{self.base_url}/api/conversations",
+            headers=self._headers,
+            params=params,
+        ) as resp:
+            resp.raise_for_status()
+            data: dict = await resp.json()
+        return data.get("_embedded", {}).get("conversations", [])
